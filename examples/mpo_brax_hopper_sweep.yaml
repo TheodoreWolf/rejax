@@ -1,0 +1,91 @@
+program: examples/mpo_brax_hopper_wandb.py
+method: random
+project: rejax-benchmark
+entity: flair
+
+command:
+  - ${env}
+  - python3
+  - ${program}
+
+metric:
+  name: eval/return_mean
+  goal: maximize
+
+parameters:
+  env:
+    values:
+      - brax/ant
+      - brax/halfcheetah
+      - brax/hopper
+      - brax/humanoidstandup
+      - brax/pusher
+      - brax/reacher
+      - brax/swimmer
+      - brax/walker2d
+  backend:
+    value: mjx
+  seed:
+    value: 0
+  num_seeds:
+    value: 3
+  total_timesteps:
+    value: 1000000
+  eval_freq:
+    value: 50000
+  num_envs:
+    values: [64, 128, 256]
+  buffer_size:
+    values: [100000, 250000, 500000]
+  fill_buffer:
+    values: [2048, 8192, 16384]
+  batch_size:
+    values: [256, 512, 1024]
+  num_epochs:
+    values: [1, 4]
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.003
+  dual_learning_rate:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.1
+  gamma:
+    values: [0.97, 0.99, 0.995]
+  max_grad_norm:
+    values: [1.0, 10.0, 100.0]
+  num_action_samples:
+    values: [10, 20, 40]
+  policy_eval_num_val_samples:
+    values: [32, 64, 128]
+  target_network_update_freq:
+    values: [1, 10, 100]
+  polyak:
+    values: [0.0, 0.9, 0.99]
+  epsilon:
+    values: [0.03, 0.1, 0.3]
+  epsilon_mean:
+    distribution: log_uniform_values
+    min: 0.0005
+    max: 0.01
+  epsilon_stddev:
+    distribution: log_uniform_values
+    min: 0.000001
+    max: 0.001
+  epsilon_penalty:
+    distribution: log_uniform_values
+    min: 0.0001
+    max: 0.01
+  action_penalization:
+    values: [true, false]
+  per_dim_constraining:
+    value: true
+  activation:
+    values: [relu, tanh]
+  hidden_layer_sizes:
+    values: ["64,64", "128,128", "256,256"]
+  normalize_observations:
+    value: true
+  skip_initial_evaluation:
+    value: true
