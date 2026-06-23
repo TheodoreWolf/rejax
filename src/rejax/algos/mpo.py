@@ -7,6 +7,8 @@ Main differences from original implementation:
 - We don't calculate any diagnostics.
 """
 
+from collections import namedtuple
+
 import chex
 import distrax
 import jax
@@ -14,7 +16,6 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax import struct
-from flax.core.frozen_dict import FrozenDict
 from flax.training.train_state import TrainState
 from jax import numpy as jnp
 
@@ -26,12 +27,25 @@ from rejax.algos.mixins import (
     TargetNetworkMixin,
 )
 from rejax.buffers import Minibatch
-from rejax.networks import ClippedGaussianPolicy, ClippedQNetwork
+from rejax.networks import GaussianPolicy, QNetwork
 
 
-_MPO_FLOAT_EPSILON = 1e-8
+_MPO_EPS = 1e-8
 _MIN_LOG_TEMPERATURE = -18.0
 _MIN_LOG_ALPHA = -18.0
+
+# Lagrange dual variables. log_penalty_temperature is only used when
+# action_penalization is enabled, but is always present so the params remain a
+# fixed pytree structure.
+DualParams = namedtuple(
+    "DualParams",
+    [
+        "log_temperature",
+        "log_alpha_mean",
+        "log_alpha_stddev",
+        "log_penalty_temperature",
+    ],
+)
 
 
 def compute_weights_and_temperature_loss(q_values, epsilon, temperature):
@@ -114,8 +128,6 @@ class MPO(
     per_dim_constraining: bool = struct.field(pytree_node=False, default=True)
     # MO-MPO action penalization from the Acme loss.
     action_penalization: bool = struct.field(pytree_node=False, default=True)
-    target_update_freq: int = struct.field(pytree_node=False, default=100)
-    polyak: chex.Scalar = struct.field(pytree_node=True, default=0.0)
 
     # KL constraint thresholds
     epsilon: chex.Scalar = struct.field(pytree_node=True, default=0.1)
@@ -150,28 +162,28 @@ class MPO(
         agent_kwargs["hidden_layer_sizes"] = tuple(layers)
 
         action_space = env.action_space(env_params)
-        actor = ClippedGaussianPolicy(
+        actor = GaussianPolicy(
             np.prod(action_space.shape),
             (action_space.low, action_space.high),
             **agent_kwargs,
         )
-        critic = ClippedQNetwork((action_space.low, action_space.high), **agent_kwargs)
+        critic = QNetwork(**agent_kwargs)
         return {"actor": actor, "critic": critic}
 
     @classmethod
     def clip_dual_params(cls, params):
-        clipped = {
-            "log_temperature": jnp.maximum(
-                _MIN_LOG_TEMPERATURE, params["log_temperature"]
+        return DualParams(
+            log_temperature=jnp.maximum(_MIN_LOG_TEMPERATURE, params.log_temperature),
+            log_alpha_mean=jnp.maximum(_MIN_LOG_ALPHA, params.log_alpha_mean),
+            log_alpha_stddev=jnp.maximum(_MIN_LOG_ALPHA, params.log_alpha_stddev),
+            log_penalty_temperature=jnp.maximum(
+                _MIN_LOG_TEMPERATURE, params.log_penalty_temperature
             ),
-            "log_alpha_mean": jnp.maximum(_MIN_LOG_ALPHA, params["log_alpha_mean"]),
-            "log_alpha_stddev": jnp.maximum(_MIN_LOG_ALPHA, params["log_alpha_stddev"]),
-        }
-        if "log_penalty_temperature" in params:
-            clipped["log_penalty_temperature"] = jnp.maximum(
-                _MIN_LOG_TEMPERATURE, params["log_penalty_temperature"]
-            )
-        return FrozenDict(clipped)
+        )
+
+    def clip_action(self, action):
+        action_space = self.env.action_space(self.env_params)
+        return jnp.clip(action, action_space.low, action_space.high)
 
     @register_init
     def initialize_network_params(self, rng):
@@ -194,17 +206,13 @@ class MPO(
         critic_ts = TrainState.create(apply_fn=(), params=critic_params, tx=tx)
 
         action_dim = int(np.prod(self.env.action_space(self.env_params).shape))
-        dual_shape = (action_dim,) if self.per_dim_constraining else (1,)
-        dual_params = {
-            "log_temperature": jnp.full((1,), self.init_log_temperature),
-            "log_alpha_mean": jnp.full(dual_shape, self.init_log_alpha_mean),
-            "log_alpha_stddev": jnp.full(dual_shape, self.init_log_alpha_stddev),
-        }
-        if self.action_penalization:
-            dual_params["log_penalty_temperature"] = jnp.full(
-                (1,), self.init_log_temperature
-            )
-        dual_params = FrozenDict(dual_params)
+        dual_shape = (action_dim,) if self.per_dim_constraining else ()
+        dual_params = DualParams(
+            log_temperature=jnp.full((), self.init_log_temperature),
+            log_alpha_mean=jnp.full(dual_shape, self.init_log_alpha_mean),
+            log_alpha_stddev=jnp.full(dual_shape, self.init_log_alpha_stddev),
+            log_penalty_temperature=jnp.full((), self.init_log_temperature),
+        )
         dual_ts = TrainState.create(apply_fn=(), params=dual_params, tx=dual_tx)
 
         return {
@@ -213,7 +221,6 @@ class MPO(
             "critic_ts": critic_ts,
             "critic_target_params": critic_params,
             "dual_ts": dual_ts,
-            "learner_step": 0,
         }
 
     def collect_transitions(self, ts):
@@ -270,14 +277,13 @@ class MPO(
             next_actions = target_dist.sample(
                 seed=action_rng, sample_shape=(self.policy_eval_num_val_samples,)
             )
+            next_actions = self.clip_action(next_actions)
 
             qs_next = jax.vmap(
                 lambda a: self.critic.apply(ts.critic_target_params, mb.next_obs, a)
             )(next_actions)
             q_target = jnp.mean(qs_next, axis=0)
-            target = jax.lax.stop_gradient(
-                mb.reward + self.gamma * (1 - mb.done) * q_target
-            )
+            target = mb.reward + self.gamma * (1 - mb.done) * q_target
 
             qs = self.critic.apply(params, mb.obs, mb.action)
             return optax.l2_loss(qs, target).mean()
@@ -297,27 +303,26 @@ class MPO(
             seed=sample_rng, sample_shape=(self.num_action_samples,)
         )  # [N, B, D]
 
+        # Raw samples are kept for the M-step log-probs and action penalty; the
+        # critic only sees clipped actions (as ClippedQNetwork used to enforce).
         q_values = jax.vmap(
-            lambda a: self.critic.apply(ts.critic_target_params, mb.obs, a)
+            lambda a: self.critic.apply(
+                ts.critic_target_params, mb.obs, self.clip_action(a)
+            )
         )(sampled_actions)  # [N, B]
 
         target_mean = target_dist.loc
         target_scale = target_dist.scale_diag
 
         def actor_and_dual_loss(actor_params, dual_params):
+            sp = jax.nn.softplus
             online_dist = self.actor.apply(actor_params, mb.obs, method="_action_dist")
             online_mean = online_dist.loc  # [B, D]
             online_scale = online_dist.scale_diag  # [B, D]
 
-            temperature = (
-                jax.nn.softplus(dual_params["log_temperature"]) + _MPO_FLOAT_EPSILON
-            ).squeeze()
-            alpha_mean = (
-                jax.nn.softplus(dual_params["log_alpha_mean"]) + _MPO_FLOAT_EPSILON
-            )
-            alpha_stddev = (
-                jax.nn.softplus(dual_params["log_alpha_stddev"]) + _MPO_FLOAT_EPSILON
-            )
+            temperature = sp(dual_params.log_temperature) + _MPO_EPS
+            alpha_mean = sp(dual_params.log_alpha_mean) + _MPO_EPS
+            alpha_stddev = sp(dual_params.log_alpha_stddev) + _MPO_EPS
 
             # E-step: normalized importance weights
             normalized_weights, loss_temperature = compute_weights_and_temperature_loss(
@@ -325,10 +330,7 @@ class MPO(
             )
 
             if self.action_penalization:
-                penalty_temp = (
-                    jax.nn.softplus(dual_params["log_penalty_temperature"])
-                    + _MPO_FLOAT_EPSILON
-                ).squeeze()
+                penalty_temp = sp(dual_params.log_penalty_temperature) + _MPO_EPS
                 diff_oob = sampled_actions - jnp.clip(sampled_actions, -1.0, 1.0)
                 cost_oob = -jnp.linalg.norm(diff_oob, axis=-1)  # [N, B]
                 penalty_weights, loss_penalty_temp = (
@@ -399,26 +401,13 @@ class MPO(
             dual_ts=ts.dual_ts.replace(params=self.clip_dual_params(ts.dual_ts.params))
         )
 
-    def update_target_networks(self, ts):
-        learner_step = ts.learner_step + 1
-        return ts.replace(
-            actor_target_params=self.update_target_params(
-                ts.actor_ts.params, ts.actor_target_params, learner_step
-            ),
-            critic_target_params=self.update_target_params(
-                ts.critic_ts.params, ts.critic_target_params, learner_step
-            ),
-            learner_step=learner_step,
-        )
-
     def update(self, ts, mb):
         ts = self.update_critic(ts, mb)
         ts = self.update_actor_and_duals(ts, mb)
-        # NOTE: bit of an overload, we are reusing the update_target_networks method
-        # but here we are updating within learner updates rather than global steps.
-        return self.update_target_networks(ts)
+        return ts
 
     def train_iteration(self, ts):
+        old_global_step = ts.global_step
         ts, batch = self.collect_transitions(ts)
         ts = ts.replace(replay_buffer=ts.replay_buffer.extend(batch))
 
@@ -444,6 +433,21 @@ class MPO(
 
         ts = jax.lax.cond(
             ts.global_step > self.fill_buffer, lambda: do_updates(ts), lambda: ts
+        )
+
+        ts = ts.replace(
+            actor_target_params=self.maybe_update_target_params(
+                ts.actor_ts.params,
+                ts.actor_target_params,
+                ts.global_step,
+                old_global_step,
+            ),
+            critic_target_params=self.maybe_update_target_params(
+                ts.critic_ts.params,
+                ts.critic_target_params,
+                ts.global_step,
+                old_global_step,
+            ),
         )
 
         return ts
