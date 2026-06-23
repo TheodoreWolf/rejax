@@ -5,6 +5,14 @@ Main differences from original implementation:
 - We use a scalar critic rather than a distributional one.
 - We do a 1-step TD update rather than the default 5.
 - We don't calculate any diagnostics.
+- We reuse rejax's GaussianPolicy, whose standard deviation is a learned but
+  observation-independent parameter, rather than Acme's state-dependent scale
+  head (which outputs a per-observation scale).
+- Actions are clipped to the action space within MPO (before feeding the critic
+  and when acting in the env) rather than inside dedicated network modules.
+- Target networks are updated on a global-step schedule via rejax's
+  TargetNetworkMixin (supporting both hard updates via target_update_freq and
+  polyak averaging), rather than Acme's fixed learner-step update period.
 """
 
 from collections import namedtuple
@@ -304,7 +312,7 @@ class MPO(
         )  # [N, B, D]
 
         # Raw samples are kept for the M-step log-probs and action penalty; the
-        # critic only sees clipped actions (as ClippedQNetwork used to enforce).
+        # critic only sees clipped actions.
         q_values = jax.vmap(
             lambda a: self.critic.apply(
                 ts.critic_target_params, mb.obs, self.clip_action(a)
